@@ -74,7 +74,7 @@ extern const AVFilter ff_af_apsyclip;
 extern const AVFilter ff_af_apulsator;
 extern const AVFilter ff_af_arealtime;
 extern const AVFilter ff_af_aresample;
-extern const AVFilter ff_af_asamplemerge;
+extern const AVFilter ff_af_asamplepack;
 extern const AVFilter ff_af_areverse;
 extern const AVFilter ff_af_arnndn;
 extern const AVFilter ff_af_asdr;
