@@ -94,6 +94,7 @@ OBJS-$(CONFIG_ASEGMENT_FILTER)               += f_segment.o
 OBJS-$(CONFIG_ASELECT_FILTER)                += f_select.o
 OBJS-$(CONFIG_ASENDCMD_FILTER)               += f_sendcmd.o
 OBJS-$(CONFIG_ASETNSAMPLES_FILTER)           += af_asetnsamples.o
+OBJS-$(CONFIG_ASAMPLEMERGE_FILTER)           += af_asamplemerge.o
 OBJS-$(CONFIG_ASETPTS_FILTER)                += setpts.o
 OBJS-$(CONFIG_ASETRATE_FILTER)               += af_asetrate.o
 OBJS-$(CONFIG_ASETTB_FILTER)                 += settb.o
