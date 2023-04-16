@@ -27,98 +27,125 @@
 #include "audio.h"
 #include "avfilter.h"
 #include "filters.h"
+#include "float.h"
 #include "formats.h"
 #include "internal.h"
+#include "libavutil/audio_fifo.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/opt.h"
 
-typedef struct AmergeCtx {
+typedef struct ApackCtx {
   const AVClass *class;
-  int nb_out_samples; ///< how many samples to output
-  int bypass;
-} AmergeCtx;
+  int nbOutSamples; ///< how many samples to output
+  uint64_t sampleSum;
+  AVAudioFifo *audioFifo;
+  int frameFormat;
+  int nbChannels;
+  int sampleRate;
+  uint64_t channelLayout;
+  AVRational timeBase;
+  uint64_t pts;
+  uint64_t ptsOffset;
+} ApackCtx;
 
-#define OFFSET(x) offsetof(AmergeCtx, x)
+#define OFFSET(x) offsetof(ApackCtx, x)
 #define FLAGS AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
 
 static const AVOption asamplepack_options[] = {
-    {"n", "set the number of per-frame output samples", OFFSET(nb_out_samples), AV_OPT_TYPE_INT, {.i64 = 1764}, 1, INT_MAX, FLAGS},
-    {"bypass", "bypass the filter output = input", OFFSET(bypass), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
+    {"n", "set the number of per-frame output samples", OFFSET(nbOutSamples), AV_OPT_TYPE_INT, {.i64 = 1764}, 1, INT_MAX, FLAGS},
+    {"time_base", NULL, OFFSET(timeBase), AV_OPT_TYPE_RATIONAL, {.dbl = 0}, 0, DBL_MAX, FLAGS},
     {NULL}};
 
 AVFILTER_DEFINE_CLASS(asamplepack);
 
-static int activate(AVFilterContext *ctx) {
-  AVFilterLink *inlink = ctx->inputs[0];
-  AVFilterLink *outlink = ctx->outputs[0];
-  AmergeCtx *s = ctx->priv;
-  AVFrame *frame = NULL, *pad_frame;
+static int filter_frame(AVFilterLink *inlink, AVFrame *inFrame) {
   int ret;
+  AVFilterContext *ctx = inlink->dst;
+  ApackCtx *s = ctx->priv;
+  AVFilterLink *const outlink = ctx->outputs[0];
 
-  printf("Thomas:: called the asamplepack filter\n");
+  if (!s->audioFifo) {
+    s->audioFifo = av_audio_fifo_alloc(inFrame->format,
+                                       inFrame->ch_layout.nb_channels,
+                                       4 * s->nbOutSamples);
 
-  // create a simple bypass for testing
-  FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
-
-  ret = ff_inlink_consume_samples(inlink, s->nb_out_samples, s->nb_out_samples, &frame);
-  // printf("Thomas:: called we consumed samples | Frame format = %i | In Link Format = %i | Out Link Format = %i |(%i)\n",
-  //        frame->format, inlink->format, outlink->format, ret);
-
-  if (ret < 0)
-    return ret;
-
-  printf("Thomas:: bypass is set to  (%i)\n", s->bypass);
-  if (s->bypass >= 1) {
-    printf("Thomas:: going to bypass the filter\n");
-    return ff_filter_frame(outlink, frame);
+    s->nbChannels = inFrame->ch_layout.nb_channels;
+    s->frameFormat = inFrame->format;
+    s->sampleRate = inFrame->sample_rate;
+    s->channelLayout = inFrame->channel_layout;
+    s->ptsOffset = inFrame->pts;
   }
 
-  // FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+  ret = av_audio_fifo_write(s->audioFifo, inFrame->data, inFrame->nb_samples);
+  if (ret < 0) {
+    av_log(NULL, AV_LOG_ERROR, "asamplepack::could not write to fifo\n");
+    return ret;
+  }
 
-  // ret = ff_inlink_consume_samples(inlink, s->nb_out_samples, s->nb_out_samples, &frame);
-  // if (ret < 0)
-  //   return ret;
+  if (av_audio_fifo_size(s->audioFifo) >= s->nbOutSamples) {
+    // we have enough samples in the fifo to create our new output frame
+    AVFrame *outFrame = av_frame_alloc();
+    outFrame->format = s->frameFormat;
+    outFrame->channels = s->nbChannels;
+    outFrame->sample_rate = s->sampleRate;
+    outFrame->nb_samples = s->nbOutSamples;
+    outFrame->time_base = s->timeBase;
+    outFrame->channel_layout = s->channelLayout;
 
-  // if (ret > 0) {
-  //   if (!s->pad || frame->nb_samples == s->nb_out_samples)
-  //     return ff_filter_frame(outlink, frame);
+    av_frame_get_buffer(outFrame, 0);
+    ret = av_audio_fifo_read(s->audioFifo, (void **)outFrame->data, s->nbOutSamples);
+    if (ret < 0) {
+      av_frame_unref(outFrame);
+      return ret;
+    }
 
-  //   pad_frame = ff_get_audio_buffer(outlink, s->nb_out_samples);
-  //   if (!pad_frame) {
-  //     av_frame_free(&frame);
-  //     return AVERROR(ENOMEM);
-  //   }
+    s->pts = s->sampleSum * s->timeBase.den / (s->timeBase.num * s->sampleRate);
+    outFrame->pts = s->pts + s->ptsOffset;
+    outFrame->pkt_dts = outFrame->pts;
+    outFrame->best_effort_timestamp = outFrame->pts;
+    outFrame->duration = s->nbOutSamples * s->timeBase.den / (s->timeBase.num * s->sampleRate);
 
-  //   ret = av_frame_copy_props(pad_frame, frame);
-  //   if (ret < 0) {
-  //     av_frame_free(&pad_frame);
-  //     av_frame_free(&frame);
-  //     return ret;
-  //   }
+    s->sampleSum += s->nbOutSamples;
+    ret = ff_filter_frame(outlink, outFrame);
+  }
 
-  //   av_samples_copy(pad_frame->extended_data, frame->extended_data,
-  //                   0, 0, frame->nb_samples, frame->ch_layout.nb_channels, frame->format);
-  //   av_samples_set_silence(pad_frame->extended_data, frame->nb_samples,
-  //                          s->nb_out_samples - frame->nb_samples, frame->ch_layout.nb_channels,
-  //                          frame->format);
-  //   av_frame_free(&frame);
-  //   return ff_filter_frame(outlink, pad_frame);
-  // }
+  av_frame_unref(inFrame);
+  return ret;
+}
 
-  // FF_FILTER_FORWARD_STATUS(inlink, outlink);
-  // if (ff_inlink_queued_samples(inlink) >= s->nb_out_samples) {
-  //   ff_filter_set_ready(ctx, 100);
-  //   return 0;
-  // }
-  // FF_FILTER_FORWARD_WANTED(outlink, inlink);
+/**
+ * @brief request_frame
+ *
+ * the downstream filter wants some data from us.
+ * We need to get the next frame from our upstream
+ * filter which will trigger filter_frame to be called.
+ * We do not need to do any processing here, just fetching the next frame
+ *
+ * @param outlink
+ * @return int
+ */
+static int request_frame(AVFilterLink *outlink) {
+  // Request the next frame from the upstream filter
+  int ret = ff_request_frame(outlink);
+  return ret;
+}
 
-  return FFERROR_NOT_READY;
+static av_cold int preinit(AVFilterContext *ctx) {
+  ApackCtx *s = ctx->priv;
+  s->sampleSum = 0;
+  s->audioFifo = NULL;
+
+  return 0;
+}
+
+static av_cold void uninit(AVFilterContext *ctx) {
 }
 
 static const AVFilterPad asamplepack_inputs[] = {
     {
         .name = "default",
         .type = AVMEDIA_TYPE_AUDIO,
+        .filter_frame = filter_frame,
     },
 };
 
@@ -126,15 +153,17 @@ static const AVFilterPad asamplepack_outputs[] = {
     {
         .name = "default",
         .type = AVMEDIA_TYPE_AUDIO,
+        .request_frame = request_frame,
     },
 };
 
 const AVFilter ff_af_asamplepack = {
     .name = "asamplepack",
-    .description = NULL_IF_CONFIG_SMALL("Create output frames with a fixed size of 1764 samples"),
-    .priv_size = sizeof(AmergeCtx),
+    .description = NULL_IF_CONFIG_SMALL("Pack given number of samples into a new frame and auto adjust PTS"),
+    .preinit = preinit,
+    .uninit = uninit,
+    .priv_size = sizeof(ApackCtx),
     .priv_class = &asamplepack_class,
     FILTER_INPUTS(asamplepack_inputs),
     FILTER_OUTPUTS(asamplepack_outputs),
-    .activate = activate,
 };
