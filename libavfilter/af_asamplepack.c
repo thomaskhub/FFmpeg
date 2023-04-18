@@ -33,6 +33,7 @@
 #include "libavutil/audio_fifo.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/opt.h"
+#include "libavutil/thread.h"
 
 typedef struct ApackCtx {
   const AVClass *class;
@@ -46,6 +47,7 @@ typedef struct ApackCtx {
   AVRational timeBase;
   uint64_t pts;
   uint64_t ptsOffset;
+  AVMutex mutex;
 } ApackCtx;
 
 #define OFFSET(x) offsetof(ApackCtx, x)
@@ -63,6 +65,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inFrame) {
   AVFilterContext *ctx = inlink->dst;
   ApackCtx *s = ctx->priv;
   AVFilterLink *const outlink = ctx->outputs[0];
+  AVFrame *outFrame;
 
   if (!s->audioFifo) {
     s->audioFifo = av_audio_fifo_alloc(inFrame->format,
@@ -82,9 +85,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inFrame) {
     return ret;
   }
 
-  if (av_audio_fifo_size(s->audioFifo) >= s->nbOutSamples) {
+  while (av_audio_fifo_size(s->audioFifo) >= s->nbOutSamples) {
     // we have enough samples in the fifo to create our new output frame
-    AVFrame *outFrame = av_frame_alloc();
+    outFrame = av_frame_alloc();
     outFrame->format = s->frameFormat;
     outFrame->channels = s->nbChannels;
     outFrame->sample_rate = s->sampleRate;
@@ -103,10 +106,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *inFrame) {
     outFrame->pts = s->pts + s->ptsOffset;
     outFrame->pkt_dts = outFrame->pts;
     outFrame->best_effort_timestamp = outFrame->pts;
-    outFrame->duration = s->nbOutSamples * s->timeBase.den / (s->timeBase.num * s->sampleRate);
-
+    outFrame->duration = s->nbOutSamples; // * s->timeBase.den / (s->timeBase.num * s->sampleRate);
     s->sampleSum += s->nbOutSamples;
+
     ret = ff_filter_frame(outlink, outFrame);
+    if (ret < 0) {
+      av_log(NULL, AV_LOG_ERROR, "asamplepack::ff_filter_Frame error (%i)\n", ret);
+    }
+    outFrame = NULL;
   }
 
   av_frame_unref(inFrame);
@@ -134,7 +141,6 @@ static av_cold int preinit(AVFilterContext *ctx) {
   ApackCtx *s = ctx->priv;
   s->sampleSum = 0;
   s->audioFifo = NULL;
-
   return 0;
 }
 
@@ -153,7 +159,7 @@ static const AVFilterPad asamplepack_outputs[] = {
     {
         .name = "default",
         .type = AVMEDIA_TYPE_AUDIO,
-        .request_frame = request_frame,
+        // .request_frame = request_frame,
     },
 };
 
